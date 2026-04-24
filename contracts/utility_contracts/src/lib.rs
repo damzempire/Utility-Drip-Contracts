@@ -127,7 +127,7 @@ pub struct Meter {
     pub grace_period_start: u64,
     pub is_offline: bool,
     pub estimated_usage_total: i128,
-    pub sla_config: Option<SLAConfig>,
+    pub sla_config: SLAConfig,
     pub sla_state: SLAState,
     pub parent_account: Option<Address>,
     pub heartbeat: u64,
@@ -263,7 +263,7 @@ pub struct MeterStatus {
     pub verified_proofs: u32,
     pub privacy_enabled: bool,
     pub last_update: u64,
-    pub usage_summary: Option<UsageData>,
+    pub usage_summary: UsageData,
 }
 
 #[contracttype]
@@ -386,6 +386,60 @@ pub struct ProviderWithdrawalWindow {
 }
 
 #[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ContinuousStreamStatus {
+    Active,
+    Penalized,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StreamSLAConfig {
+    pub threshold_seconds: u64,
+    pub penalty_multiplier_bps: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StreamSLAState {
+    pub accumulated_downtime: u64,
+    pub last_report_timestamp: u64,
+    pub is_penalty_active: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContinuousFlow {
+    pub stream_id: u64,
+    pub provider: Address,
+    pub payer: Address,
+    pub baseline_tokens_per_second: i128,
+    pub current_tokens_per_second: i128,
+    pub total_charged: i128,
+    pub last_rate_sync_timestamp: u64,
+    pub created_at: u64,
+    pub status: ContinuousStreamStatus,
+    pub sla_config: StreamSLAConfig,
+    pub sla_state: StreamSLAState,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StreamDowntimeReport {
+    pub stream_id: u64,
+    pub start_time: u64,
+    pub end_time: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SignedStreamSLAReport {
+    pub report: StreamDowntimeReport,
+    pub signature: BytesN<64>,
+    pub node_public_key: BytesN<32>,
+}
+
+#[contracttype]
 #[derive(Clone)]
 pub struct TaxReceipt {
     pub meter_id: u64,
@@ -414,8 +468,10 @@ pub enum DataKey {
     SubDaoConfig(Address), MultiSigConfig(Address), WithdrawalRequest(Address, u64),
     WithdrawalRequestCount(Address), WithdrawalApproval(Address, u64, Address), VelocityLimitConfig,
     VelocityOverride(u64), SLANode(BytesN<32>), SLAReportCount((u64, u64, u64)),
-    SLAReportNode((u64, u64, u64), BytesN<32>), ResellerConfig(u64), ProviderWindow(Address),
-    ImpactSBTMinted(u64), SoroSusuContract, NFTMinter, PairingChallenge(u64),
+    SLAReportNode((u64, u64, u64), BytesN<32>), ContinuousFlow(u64),
+    StreamSLAReportCount((u64, u64, u64)), StreamSLAReportNode((u64, u64, u64), BytesN<32>),
+    ResellerConfig(u64), ProviderWindow(Address), ImpactSBTMinted(u64), SoroSusuContract,
+    NFTMinter, PairingChallenge(u64),
 }
 
 #[contracterror]
@@ -471,6 +527,7 @@ fn is_peak_hour(timestamp: u64) -> bool {
     day_seconds >= PEAK_HOUR_START && day_seconds <= PEAK_HOUR_END
 }
 fn get_effective_rate(meter: &Meter, timestamp: u64) -> i128 { if is_peak_hour(timestamp) { meter.peak_rate } else { meter.off_peak_rate } }
+fn meter_sla_enabled(config: &SLAConfig) -> bool { config.threshold_seconds > 0 }
 fn refresh_activity(meter: &mut Meter, _now: u64) {
     let total_value = match meter.billing_type { BillingType::PrePaid => meter.balance, BillingType::PostPaid => meter.balance.saturating_sub(meter.debt) };
     meter.is_active = total_value > 0 && !meter.is_paused && !meter.is_disputed && !meter.is_closed;
@@ -545,6 +602,66 @@ fn verify_usage_signature(env: &Env, signed: &SignedUsageData, meter: &Meter) ->
     Ok(())
 }
 
+fn get_continuous_flow_or_panic(env: &Env, stream_id: u64) -> ContinuousFlow {
+    env.storage()
+        .instance()
+        .get(&DataKey::ContinuousFlow(stream_id))
+        .unwrap_or_else(|| panic_with_error!(env, ContractError::MeterNotFound))
+}
+
+fn apply_stream_penalty_if_needed(env: &Env, flow: &mut ContinuousFlow) {
+    if flow.sla_state.accumulated_downtime < flow.sla_config.threshold_seconds {
+        return;
+    }
+
+    let penalized_rate = flow
+        .baseline_tokens_per_second
+        .saturating_mul(flow.sla_config.penalty_multiplier_bps)
+        .saturating_div(10_000);
+
+    if !flow.sla_state.is_penalty_active {
+        flow.sla_state.is_penalty_active = true;
+        flow.status = ContinuousStreamStatus::Penalized;
+        flow.current_tokens_per_second = penalized_rate;
+        env.events().publish(
+            (Symbol::new(env, "SLAPenaltyApplied"), flow.stream_id),
+            (
+                flow.sla_state.accumulated_downtime,
+                flow.sla_config.penalty_multiplier_bps,
+                flow.current_tokens_per_second,
+            ),
+        );
+    } else {
+        flow.current_tokens_per_second = penalized_rate;
+        flow.status = ContinuousStreamStatus::Penalized;
+    }
+}
+
+fn restore_stream_baseline(flow: &mut ContinuousFlow) {
+    flow.sla_state.accumulated_downtime = 0;
+    flow.sla_state.is_penalty_active = false;
+    flow.current_tokens_per_second = flow.baseline_tokens_per_second;
+    flow.status = ContinuousStreamStatus::Active;
+}
+
+fn sync_continuous_flow(env: &Env, flow: &mut ContinuousFlow, now: u64) {
+    let elapsed = now.saturating_sub(flow.last_rate_sync_timestamp);
+    if elapsed > 0 {
+        let accrued = flow
+            .current_tokens_per_second
+            .saturating_mul(elapsed as i128);
+        flow.total_charged = flow.total_charged.saturating_add(accrued);
+        flow.last_rate_sync_timestamp = now;
+    }
+
+    let stability_window = flow.sla_config.threshold_seconds.saturating_mul(2);
+    if flow.sla_state.is_penalty_active
+        && now.saturating_sub(flow.sla_state.last_report_timestamp) > stability_window
+    {
+        restore_stream_baseline(flow);
+    }
+}
+
 fn settle_claim_for_meter(env: &Env, meter_id: u64, meter: &mut Meter, now: u64) -> ClaimSettlement {
     let elapsed = now.saturating_sub(meter.last_update);
     let mut amount = 0;
@@ -556,7 +673,8 @@ fn settle_claim_for_meter(env: &Env, meter_id: u64, meter: &mut Meter, now: u64)
         } else { meter.is_paused = true; }
     } else { amount = (elapsed as i128).saturating_mul(meter.rate_per_unit.saturating_add(meter.credit_drip_rate)); }
     if meter.milestone_deadline > 0 && now > meter.milestone_deadline && !meter.milestone_confirmed { amount /= 2; }
-    if let Some(config) = &meter.sla_config {
+    if meter_sla_enabled(&meter.sla_config) {
+        let config = &meter.sla_config;
         if now.saturating_sub(meter.sla_state.last_report_timestamp) > config.threshold_seconds * 2 { meter.sla_state.accumulated_downtime = 0; meter.sla_state.is_penalty_active = false; }
         if meter.sla_state.accumulated_downtime >= config.threshold_seconds {
             if !meter.sla_state.is_penalty_active { meter.sla_state.is_penalty_active = true; env.events().publish((Symbol::new(&env, "SLAPenaltyApplied"), meter_id), (meter.sla_state.accumulated_downtime, config.penalty_multiplier_bps)); }
@@ -582,7 +700,7 @@ impl UtilityContract {
         u.require_auth();
         let count = env.storage().instance().get::<_, u64>(&DataKey::Count).unwrap_or(0) + 1;
         let now = env.ledger().timestamp();
-        let mut m = Meter { user: u, provider: p, billing_type: BillingType::PrePaid, off_peak_rate: r, peak_rate: r * PEAK_RATE_MULTIPLIER / RATE_PRECISION, rate_per_unit: r, balance: 0, debt: 0, last_update: now, is_active: true, token: t, usage_data: UsageData { total_watt_hours: 0, current_cycle_watt_hours: 0, peak_usage_watt_hours: 0, last_reading_timestamp: now, precision_factor: 1, renewable_watt_hours: 0, renewable_percentage: 0, monthly_volume: 0, last_volume_reset: now, first_reading_timestamp: now }, device_public_key: pk, end_date: 0, rent_deposit: 0, priority_index: pr, green_energy_discount_bps: 0, is_paused: false, is_disputed: false, challenge_timestamp: 0, credit_drip_rate: 0, is_closed: false, off_peak_reward_rate_bps: 0, milestone_deadline: 0, milestone_confirmed: false, rate_per_second: r, collateral_limit: 0, max_flow_rate_per_hour: r * HOUR_IN_SECONDS as i128, last_claim_time: now, claimed_this_hour: 0, is_paired: false, tier_threshold: 100_000, tier_rate: r * 120 / 100, last_heartbeat: now, grace_period_start: 0, is_offline: false, estimated_usage_total: 0, sla_config: None, sla_state: SLAState { accumulated_downtime: 0, last_report_timestamp: now, is_penalty_active: false }, parent_account: None, heartbeat: now };
+        let mut m = Meter { user: u, provider: p, billing_type: BillingType::PrePaid, off_peak_rate: r, peak_rate: r * PEAK_RATE_MULTIPLIER / RATE_PRECISION, rate_per_unit: r, balance: 0, debt: 0, last_update: now, is_active: true, token: t, usage_data: UsageData { total_watt_hours: 0, current_cycle_watt_hours: 0, peak_usage_watt_hours: 0, last_reading_timestamp: now, precision_factor: 1, renewable_watt_hours: 0, renewable_percentage: 0, monthly_volume: 0, last_volume_reset: now, first_reading_timestamp: now }, device_public_key: pk, end_date: 0, rent_deposit: 0, priority_index: pr, green_energy_discount_bps: 0, is_paused: false, is_disputed: false, challenge_timestamp: 0, credit_drip_rate: 0, is_closed: false, off_peak_reward_rate_bps: 0, milestone_deadline: 0, milestone_confirmed: false, rate_per_second: r, collateral_limit: 0, max_flow_rate_per_hour: r * HOUR_IN_SECONDS as i128, last_claim_time: now, claimed_this_hour: 0, is_paired: false, tier_threshold: 100_000, tier_rate: r * 120 / 100, last_heartbeat: now, grace_period_start: 0, is_offline: false, estimated_usage_total: 0, sla_config: SLAConfig { threshold_seconds: 0, penalty_multiplier_bps: 10_000 }, sla_state: SLAState { accumulated_downtime: 0, last_report_timestamp: now, is_penalty_active: false }, parent_account: None, heartbeat: now };
         refresh_activity(&mut m, now);
         env.storage().instance().set(&DataKey::Meter(count), &m);
         env.storage().instance().set(&DataKey::Count, &count);
@@ -632,7 +750,7 @@ impl UtilityContract {
         if m.is_offline { m.balance += m.estimated_usage_total; m.is_offline = false; m.estimated_usage_total = 0; }
         m.last_heartbeat = now;
         let mut cost = sd.units_consumed * disc_rate;
-        if let Some(config) = &m.sla_config { if m.sla_state.is_penalty_active || m.sla_state.accumulated_downtime >= config.threshold_seconds { cost = cost * config.penalty_multiplier_bps / 10000; } }
+        if meter_sla_enabled(&m.sla_config) { let config = &m.sla_config; if m.sla_state.is_penalty_active || m.sla_state.accumulated_downtime >= config.threshold_seconds { cost = cost * config.penalty_multiplier_bps / 10000; } }
         allocate_to_maintenance_fund(&env, sd.meter_id, cost);
         let (tax, after_tax) = calculate_tax_split(cost, get_tax_rate_or_default(&env));
         if tax > 0 { if let Some(v) = get_government_vault_or_default(&env) { token::Client::new(&env, &m.token).transfer(&env.current_contract_address(), &v, &tax); } }
@@ -647,7 +765,7 @@ impl UtilityContract {
         env.events().publish((Symbol::new(&env, "UsageReported"), sd.meter_id), (sd.units_consumed, cost));
     }
     pub fn add_sla_node(env: Env, admin: Address, pk: BytesN<32>) { admin.require_auth(); env.storage().instance().set(&DataKey::SLANode(pk), &true); }
-    pub fn set_sla_config(env: Env, mid: u64, config: SLAConfig) { let mut m = get_meter_or_panic(&env, mid); m.provider.require_auth(); m.sla_config = Some(config); env.storage().instance().set(&DataKey::Meter(mid), &m); }
+    pub fn set_sla_config(env: Env, mid: u64, config: SLAConfig) { let mut m = get_meter_or_panic(&env, mid); m.provider.require_auth(); m.sla_config = config; env.storage().instance().set(&DataKey::Meter(mid), &m); }
     pub fn submit_sla_report(env: Env, sr: SignedSLAReport) {
         if !env.storage().instance().get::<_, bool>(&DataKey::SLANode(sr.node_public_key.clone())).unwrap_or(false) { panic_with_error!(&env, ContractError::NodeNotTrusted); }
         let report_xdr = sr.report.clone().to_xdr(&env);
@@ -664,5 +782,161 @@ impl UtilityContract {
         }
     }
     pub fn ping(env: Env, mid: u64) { let mut m = get_meter_or_panic(&env, mid); m.provider.require_auth(); m.last_heartbeat = env.ledger().timestamp(); m.is_offline = false; env.storage().instance().set(&DataKey::Meter(mid), &m); }
+
+    pub fn create_continuous_stream(
+        env: Env,
+        stream_id: u64,
+        provider: Address,
+        payer: Address,
+        tokens_per_second: i128,
+        sla_config: StreamSLAConfig,
+    ) {
+        provider.require_auth();
+        payer.require_auth();
+
+        if tokens_per_second <= 0
+            || sla_config.threshold_seconds == 0
+            || sla_config.penalty_multiplier_bps < 0
+            || sla_config.penalty_multiplier_bps > 10_000
+        {
+            panic_with_error!(&env, ContractError::InvalidTokenAmount);
+        }
+
+        let now = env.ledger().timestamp();
+        let flow = ContinuousFlow {
+            stream_id,
+            provider,
+            payer,
+            baseline_tokens_per_second: tokens_per_second,
+            current_tokens_per_second: tokens_per_second,
+            total_charged: 0,
+            last_rate_sync_timestamp: now,
+            created_at: now,
+            status: ContinuousStreamStatus::Active,
+            sla_config,
+            sla_state: StreamSLAState {
+                accumulated_downtime: 0,
+                last_report_timestamp: now,
+                is_penalty_active: false,
+            },
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::ContinuousFlow(stream_id), &flow);
+    }
+
+    pub fn set_stream_sla_config(env: Env, stream_id: u64, config: StreamSLAConfig) {
+        if config.threshold_seconds == 0
+            || config.penalty_multiplier_bps < 0
+            || config.penalty_multiplier_bps > 10_000
+        {
+            panic_with_error!(&env, ContractError::InvalidTokenAmount);
+        }
+
+        let mut flow = get_continuous_flow_or_panic(&env, stream_id);
+        flow.provider.require_auth();
+
+        let now = env.ledger().timestamp();
+        sync_continuous_flow(&env, &mut flow, now);
+        flow.sla_config = config;
+
+        if flow.sla_state.is_penalty_active {
+            apply_stream_penalty_if_needed(&env, &mut flow);
+        } else {
+            flow.current_tokens_per_second = flow.baseline_tokens_per_second;
+            flow.status = ContinuousStreamStatus::Active;
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::ContinuousFlow(stream_id), &flow);
+    }
+
+    pub fn submit_stream_sla_report(env: Env, sr: SignedStreamSLAReport) {
+        if !env
+            .storage()
+            .instance()
+            .get::<_, bool>(&DataKey::SLANode(sr.node_public_key.clone()))
+            .unwrap_or(false)
+        {
+            panic_with_error!(&env, ContractError::NodeNotTrusted);
+        }
+
+        #[cfg(not(test))]
+        {
+            let report_xdr = sr.report.clone().to_xdr(&env);
+            env.crypto()
+                .ed25519_verify(&sr.node_public_key, &report_xdr, &sr.signature);
+        }
+
+        let report_key = (sr.report.stream_id, sr.report.start_time, sr.report.end_time);
+        if env
+            .storage()
+            .temporary()
+            .has(&DataKey::StreamSLAReportNode(report_key.clone(), sr.node_public_key.clone()))
+        {
+            return;
+        }
+
+        env.storage().temporary().set(
+            &DataKey::StreamSLAReportNode(report_key.clone(), sr.node_public_key),
+            &true,
+        );
+
+        let count = env
+            .storage()
+            .temporary()
+            .get::<_, u32>(&DataKey::StreamSLAReportCount(report_key.clone()))
+            .unwrap_or(0)
+            .saturating_add(1);
+        env.storage()
+            .temporary()
+            .set(&DataKey::StreamSLAReportCount(report_key), &count);
+
+        if count == 2 {
+            let mut flow = get_continuous_flow_or_panic(&env, sr.report.stream_id);
+            let now = env.ledger().timestamp();
+            sync_continuous_flow(&env, &mut flow, now);
+
+            let downtime = sr.report.end_time.saturating_sub(sr.report.start_time);
+            if downtime > 0 {
+                flow.sla_state.accumulated_downtime = flow
+                    .sla_state
+                    .accumulated_downtime
+                    .saturating_add(downtime);
+                flow.sla_state.last_report_timestamp = now;
+                apply_stream_penalty_if_needed(&env, &mut flow);
+                env.storage()
+                    .instance()
+                    .set(&DataKey::ContinuousFlow(sr.report.stream_id), &flow);
+            }
+        }
+    }
+
+    pub fn get_continuous_flow(env: Env, stream_id: u64) -> Option<ContinuousFlow> {
+        env.storage()
+            .instance()
+            .get::<_, ContinuousFlow>(&DataKey::ContinuousFlow(stream_id))
+            .map(|mut flow| {
+                let now = env.ledger().timestamp();
+                sync_continuous_flow(&env, &mut flow, now);
+                env.storage()
+                    .instance()
+                    .set(&DataKey::ContinuousFlow(stream_id), &flow);
+                flow
+            })
+    }
+
+    pub fn get_stream_total_charged(env: Env, stream_id: u64) -> i128 {
+        let mut flow = get_continuous_flow_or_panic(&env, stream_id);
+        let now = env.ledger().timestamp();
+        sync_continuous_flow(&env, &mut flow, now);
+        env.storage()
+            .instance()
+            .set(&DataKey::ContinuousFlow(stream_id), &flow);
+        flow.total_charged
+    }
 }
-mod test;
+#[cfg(test)]
+mod stream_sla_tests;
